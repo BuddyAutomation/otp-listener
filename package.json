@@ -12,6 +12,10 @@
   "dependencies": {
     "@antiadmin/anticaptchaofficial": "^1.0.49",
     "firebase-admin": "^12.6.0",
+    "googleapis": "^153.0.0",
+    "mailparser": "^3.7.4",
+    "node-imap": "^0.9.6",
+    "open": "^10.2.0",
     "p-limit": "^6.2.0",
     "puppeteer": "^22.11.2",
     "puppeteer-extra": "^3.3.6",
