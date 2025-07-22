@@ -1,3 +1,12 @@
+const http = require('http');
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("OK");
+}).listen(port, () => {
+  console.log(`✅ HTTP server listening on port ${port}`);
+});
+
 // AllListeners.js
 const Imap             = require('node-imap');
 const { simpleParser } = require('mailparser');
