@@ -5,10 +5,11 @@ const { google }       = require('googleapis');
 const admin            = require('firebase-admin');
 
 // ——— Init Firebase Admin
-const serviceAccount = require('./AllAccountServer.json');
+// Pull service account & DB URL from env
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://cookies-9077d-default-rtdb.asia-southeast1.firebasedatabase.app"
+credential: admin.credential.cert(serviceAccount),
+databaseURL: process.env.FIREBASE_DB_URL
 });
 
 // Helper to encode email into a safe RTDB key
