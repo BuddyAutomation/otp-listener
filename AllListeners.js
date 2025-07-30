@@ -1,84 +1,69 @@
+// AllListeners.js (Render.com Deployment)
+// ——————————————————————————————————————————————————————————
+// 1) PUT your Firebase service account JSON into the
+//    SERVICE_ACCOUNT_JSON env var (stringified).
+// 2) PUT your RTDB URL into FIREBASE_DB_URL env var.
+// 3) Render will set PORT for you; we expose a tiny HTTP server
+//    so Render keeps the service alive.
+
+// ——— HTTP “keep‑alive” server — listens on PORT
 const http = require('http');
 const port = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("OK");
-}).listen(port, () => {
-  console.log(`✅ HTTP server listening on port ${port}`);
-});
+http
+  .createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('OK');
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('AllListeners is running');
+  })
+  .listen(port, () => {
+    console.log(`✅ HTTP server listening on port ${port}`);
+  });
 
-// AllListeners.js
-const Imap             = require('node-imap');
+// ——— IMAP + Firebase logic
+const Imap = require('node-imap');
 const { simpleParser } = require('mailparser');
-const { google }       = require('googleapis');
-const admin            = require('firebase-admin');
+const admin = require('firebase-admin');
 
-// ——— Init Firebase Admin
-// Pull service account & DB URL from env
+// ——— Init Firebase Admin from ENV
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
-credential: admin.credential.cert(serviceAccount),
-databaseURL: process.env.FIREBASE_DB_URL
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DB_URL
 });
 
-// Helper to encode email into a safe RTDB key
-function encodeEmail(email) {
-  return email.replace(/\./g, ',');
+// Helper: email = RTDB key with commas → real dots
+function decodeEmail(key) {
+  return key.replace(/,/g, '.');
 }
 
-// Build the Base64‑encoded XOAUTH2 string
-function buildXoauth2Token(user, accessToken) {
-  const auth = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
-  return Buffer.from(auth).toString('base64');
-}
-
-// Kick off all listeners
+// Start listeners for every account in RTDB
 async function startAllListeners() {
   const snap = await admin.database().ref('/gmailAccounts').once('value');
   const accounts = snap.val();
   if (!accounts) {
-    console.error('No /gmailAccounts found!');
+    console.error('⚠️  No /gmailAccounts found!');
     return;
   }
 
   for (const key of Object.keys(accounts)) {
-    const { creds, tokens } = accounts[key];
-    const email = key.replace(/,/g, '.'); // decode back to real address
-
-    if (!creds || !tokens) {
-      console.warn(`Skipping ${email}—missing creds or tokens`);
+    const { appPassword } = accounts[key];
+    if (!appPassword) {
+      console.warn(`Skipping ${key}—missing appPassword`);
       continue;
     }
-
-    // 1) Build OAuth2 client for this account
-    const oAuth2 = new google.auth.OAuth2(
-      creds.client_id,
-      creds.client_secret,
-      (creds.redirect_uris && creds.redirect_uris[0]) || 'urn:ietf:wg:oauth:2.0:oob'
-    );
-    oAuth2.setCredentials(tokens);
-
-    // 2) Refresh to get a fresh access_token
-    let accessToken;
-    try {
-      ({ credentials: { access_token: accessToken } } =
-        await oAuth2.refreshAccessToken());
-    } catch (e) {
-      console.error(`[${email}] Token refresh failed:`, e);
-      continue;
-    }
-    const xoauth2 = buildXoauth2Token(email, accessToken);
-
-    // 3) Start IMAP listener
-    startImapFor(email, xoauth2, oAuth2);
+    const email = decodeEmail(key);
+    startImapFor(email, appPassword);
   }
 }
 
-// Start a single IMAP listener
-function startImapFor(user, xoauth2, oAuth2Client) {
+// Create one IMAP connection per account
+function startImapFor(user, password) {
   const imap = new Imap({
     user,
-    xoauth2,
+    password,
     host: 'imap.gmail.com',
     port: 993,
     tls: true
@@ -86,86 +71,76 @@ function startImapFor(user, xoauth2, oAuth2Client) {
 
   imap.once('ready', () => {
     imap.openBox('OTP', false, (err, box) => {
-      if (err) {
-        return console.error(`[${user}] openBox error:`, err);
-      }
+      if (err) return console.error(`[${user}] openBox error:`, err);
       console.log(`[${user}] watching OTP (total ${box.messages.total})`);
       fetchLatestOtps(imap, user);
       imap.on('mail', () => fetchLatestOtps(imap, user));
     });
   });
 
-  imap.once('error', async err => {
+  imap.once('error', err => {
     console.error(`[${user}] IMAP error:`, err);
-    if (err.source === 'authentication') {
-      console.log(`[${user}] reauthenticating…`);
-      try {
-        const { credentials } = await oAuth2Client.refreshAccessToken();
-        const xo = buildXoauth2Token(user, credentials.access_token);
-        startImapFor(user, xo, oAuth2Client);
-      } catch (e) {
-        console.error(`[${user}] re‑auth failed:`, e);
-      }
-    }
+    console.log(`[${user}] reconnecting in 10s…`);
+    setTimeout(() => imap.connect(), 10000);
   });
 
-  imap.once('end', () => console.log(`[${user}] connection ended`));
+  imap.once('end', () => {
+    console.log(`[${user}] connection ended—reconnecting…`);
+    setTimeout(() => imap.connect(), 10000);
+  });
+
   imap.connect();
 }
 
-// Fetch and process all unseen OTP mails
+// Pull unseen OTP emails and push into RTDB
 function fetchLatestOtps(imap, user) {
   imap.search(['UNSEEN'], (err, results) => {
-    if (err) {
-      return console.error(`[${user}] search err:`, err);
-    }
+    if (err) return console.error(`[${user}] search err:`, err);
     if (!results.length) return;
 
     const fetcher = imap.fetch(results, { bodies: '', markSeen: true });
-
     fetcher.on('message', msg => {
-      msg.on('body', async stream => {
-        try {
-          const parsed = await simpleParser(stream);
-          const toAddr = parsed.to.value[0].address;
-          const local  = toAddr.split('@')[0];
-          const [name, num] = local.includes('+')
-            ? local.split('+')
-            : local.split(/(\d+)$/).filter(Boolean);
-
-          // 1) Try your two HTML patterns first
-          const html = (parsed.html || '').replace(/\r?\n/g, ' ');
-          let m =
-            html.match(/<div[^>]*>\s*<span[^>]*>\s*(\d{4,8})\s*<\/span>\s*<\/div>/) ||
-            html.match(/<td[^>]*>\s*<p>\s*(\d{4,8})\s*<\/p>/);
-
-          // 2) If that fails, fall back to exactly six digits in plain‑text
-          if (!m) {
-            const text = (parsed.text || '').trim();
-            m = text.match(/\b(\d{6})\b/);
-          }
-
-          if (!m) {
-            return console.warn(`[${user}] no OTP in ${toAddr}`);
-          }
-
-          const otp = m[1];
-          await admin
-            .database()
-            .ref(`/OTP/${name.toLowerCase()}/${num}`)
-            .set({ otp, ts: admin.database.ServerValue.TIMESTAMP });
-
-          console.log(`[${user}] saved ${otp} → /OTP/${name.toLowerCase()}/${num}`);
-        } catch (e) {
-          console.error(`[${user}] msg handler err:`, e);
-        }
-      });
+        msg.on('body', async stream => {
+            try {
+              const parsed = await simpleParser(stream);
+              const toAddr = parsed.to.value[0].address;
+              const local  = toAddr.split('@')[0];
+              const [name, num] = local.includes('+')
+                ? local.split('+')
+                : local.split(/(\d+)$/).filter(Boolean);
+    
+              // 1) Try your two HTML patterns first
+              const html = (parsed.html || '').replace(/\r?\n/g, ' ');
+              let m =
+                html.match(/<div[^>]*>\s*<span[^>]*>\s*(\d{4,8})\s*<\/span>\s*<\/div>/) ||
+                html.match(/<td[^>]*>\s*<p>\s*(\d{4,8})\s*<\/p>/);
+    
+              // 2) If that fails, fall back to exactly six digits in plain‑text
+              if (!m) {
+                const text = (parsed.text || '').trim();
+                m = text.match(/\b(\d{6})\b/);
+              }
+    
+              if (!m) {
+                return console.warn(`[${user}] no OTP in ${toAddr}`);
+              }
+    
+              const otp = m[1];
+              await admin
+                .database()
+                .ref(`/OTP/${name.toLowerCase()}/${num}`)
+                .set({ otp, ts: admin.database.ServerValue.TIMESTAMP });
+    
+              console.log(`[${user}] saved ${otp} → /OTP/${name.toLowerCase()}/${num}`);
+            } catch (e) {
+              console.error(`[${user}] msg handler err:`, e);
+            }
+        });
     });
-
+    fetcher.once('end',   () => console.log(`[${user}] done processing`));
     fetcher.once('error', e => console.error(`[${user}] fetch err:`, e));
-    fetcher.once('end', () => console.log(`[${user}] done processing`));
   });
 }
 
-// Start everything
+// kick it all off
 startAllListeners().catch(console.error);
